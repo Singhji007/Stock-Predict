@@ -1,162 +1,143 @@
-import sys
-import warnings
-import argparse
-import tensorflow as tf
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-from datetime import datetime, timedelta
-from tqdm import tqdm
-from pandas_datareader import data as pdr
 import yfinance as yf
-import os
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
 
-# Suppress warnings for cleaner output
-if not sys.warnoptions:
-    warnings.simplefilter("ignore")
+# Function to calculate RSI (Relative Strength Index)
+def compute_rsi(data, window=14):
+    delta = data.diff(1)
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-sns.set()
-tf.random.set_seed(1234)
-yf.pdr_override()
+# Function to forecast future prices
+def forecast_future(data, model, scaler, steps, feature_count):
+    last_sequence = data[-TIMESTEP:]  # Use the last TIMESTEP of data for forecasting
+    future_predictions = []
 
-# Argument parser setup
-parser = argparse.ArgumentParser(description="Train Stock Market Predictor")
-parser.add_argument("--symbol", type=str, required=True, help="Stock symbol to use")
-parser.add_argument("--period", type=str, default="2y", help="Data period to download")
-parser.add_argument("--epochs", type=int, default=300, help="Number of training epochs")
-parser.add_argument("--sims", type=int, default=5, help="Number of simulations")
-args = parser.parse_args()
+    for _ in range(steps):
+        # Predict the next value
+        pred = model.predict(last_sequence.reshape(1, TIMESTEP, feature_count))
+        future_predictions.append(pred[0, 0])  # Save the predicted 'Close' value
+
+        # Pad the prediction with zeros to match feature dimensions
+        pred_padded = np.concatenate([pred, np.zeros((1, feature_count - 1))], axis=1)
+
+        # Append the prediction and shift the sequence
+        next_sequence = np.concatenate([last_sequence[1:], pred_padded], axis=0)
+        last_sequence = next_sequence
+
+    # Rescale predictions back to the original scale
+    future_predictions = scaler.inverse_transform(
+        np.concatenate([np.array(future_predictions).reshape(-1, 1), np.zeros((steps, feature_count - 1))], axis=1)
+    )[:, 0]
+    return future_predictions
 
 # Download stock data
-df = pdr.get_data_yahoo(args.symbol, period=args.period)
-df.to_csv("data.csv")
-df = pd.read_csv("data.csv")
+symbol = input("Stock Symbol (e.g., TSLA, AAPL): ")
+print(f"Downloading historical data for {symbol} (5y)...")
 
-# Preprocess data
-scaler = MinMaxScaler().fit(df[["Close"]].astype("float32"))
-df_log = scaler.transform(df[["Close"]].astype("float32"))
-df_log = pd.DataFrame(df_log)
+try:
+    df = yf.download(symbol, period="5y")
+    if df.empty:
+        raise ValueError(f"No data found for {symbol}. The symbol may be invalid or delisted.")
+except Exception as e:
+    print(e)
+    exit()
 
-# Hyperparameters
-SIMULATION_SIZE = args.sims
-NUM_LAYERS = 1
-SIZE_LAYER = 128
-TIMESTAMP = 5
-EPOCHS = args.epochs
-DROPOUT_RATE = 0.8
-TEST_SIZE = 30
-LEARNING_RATE = 0.01
+# Feature Engineering
+df["SMA_20"] = df["Close"].rolling(window=20).mean()  # 20-day Simple Moving Average
+df["EMA_10"] = df["Close"].ewm(span=10).mean()       # 10-day Exponential Moving Average
+df["RSI"] = compute_rsi(df["Close"])                 # Add Relative Strength Index (RSI)
 
-df_train = df_log
-print("Data shape:", df.shape, "Training data shape:", df_train.shape)
+# Drop NaN values introduced by rolling calculations
+df = df.dropna()
 
-# Define the LSTM model
-class StockPredictorModel(tf.keras.Model):
-    def __init__(self, num_layers, size_layer, output_size, dropout_rate):
-        super(StockPredictorModel, self).__init__()
-        self.lstm_layers = [
-            tf.keras.layers.LSTM(size_layer, return_sequences=True, return_state=True)
-            for _ in range(num_layers)
-        ]
-        self.dropout = tf.keras.layers.Dropout(dropout_rate)
-        self.dense = tf.keras.layers.Dense(output_size)
+# Select features and normalize
+features = ["Close", "SMA_20", "EMA_10", "RSI"]
+scaler = MinMaxScaler().fit(df[features])
+data_scaled = scaler.transform(df[features])
 
-    def call(self, inputs, training=False, initial_states=None):
-        x = inputs
-        states = initial_states
-        for lstm_layer in self.lstm_layers:
-            x, *states = lstm_layer(x, initial_state=states)
-        if training:
-            x = self.dropout(x)
-        x = self.dense(x)
-        return x, states
+# Prepare data for LSTM
+TIMESTEP = 50
+X, y = [], []
 
-# Helper functions
-def calculate_accuracy(real, predicted):
-    real, predicted = np.array(real) + 1, np.array(predicted) + 1
-    return (1 - np.sqrt(np.mean(np.square((real - predicted) / real)))) * 100
+for i in range(TIMESTEP, len(data_scaled)):
+    X.append(data_scaled[i-TIMESTEP:i])  # Last TIMESTEP rows as input
+    y.append(data_scaled[i, 0])         # Predict 'Close' price
 
-def anchor(signal, weight):
-    smoothed = []
-    last = signal[0]
-    for val in signal:
-        smoothed_val = last * weight + (1 - weight) * val
-        smoothed.append(smoothed_val)
-        last = smoothed_val
-    return smoothed
+X, y = np.array(X), np.array(y)
 
-# Training and forecasting
-def forecast():
-    model = StockPredictorModel(NUM_LAYERS, SIZE_LAYER, df_log.shape[1], DROPOUT_RATE)
-    optimizer = tf.keras.optimizers.Adam(LEARNING_RATE)
-    loss_fn = tf.keras.losses.MeanSquaredError()
+# Split data into training and testing
+split = int(len(X) * 0.8)
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
 
-    @tf.function
-    def train_step(inputs, targets, states):
-        with tf.GradientTape() as tape:
-            predictions, states = model(inputs, training=True, initial_states=states)
-            loss = loss_fn(targets, predictions)
-        gradients = tape.gradient(loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        return loss, states
+# Model Architecture
+model = tf.keras.Sequential([
+    tf.keras.layers.LSTM(128, return_sequences=True, input_shape=(TIMESTEP, len(features))),
+    tf.keras.layers.Dropout(0.2),
+    tf.keras.layers.LSTM(64, return_sequences=False),
+    tf.keras.layers.Dropout(0.2),
+    tf.keras.layers.Dense(1)
+])
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss="mse")
 
-    # Prepare training data
-    date_ori = pd.to_datetime(df["Date"]).tolist()
-    init_states = [tf.zeros((1, SIZE_LAYER)) for _ in range(NUM_LAYERS * 2)]
-    
-    for epoch in tqdm(range(EPOCHS), desc="Training"):
-        total_loss = []
-        for i in range(0, len(df_train) - TIMESTAMP, TIMESTAMP):
-            batch_x = tf.expand_dims(df_train.iloc[i:i+TIMESTAMP].values, axis=0)
-            batch_y = tf.expand_dims(df_train.iloc[i+1:i+TIMESTAMP+1].values, axis=0)
-            loss, init_states = train_step(batch_x, batch_y, init_states)
-            total_loss.append(loss.numpy())
-        tqdm.write(f"Epoch {epoch+1}: Loss = {np.mean(total_loss)}")
-    
-    # Forecast future values
-    future_predictions = []
-    current_states = init_states
-    input_data = tf.expand_dims(df_train[-TIMESTAMP:].values, axis=0)
+# Train the Model
+EPOCHS = 50
+BATCH_SIZE = 32
+lr_scheduler = tf.keras.callbacks.LearningRateScheduler(lambda epoch: 0.001 * (0.95 ** epoch))
 
-    for _ in range(TEST_SIZE):
-        prediction, current_states = model(input_data, training=False, initial_states=current_states)
-        future_predictions.append(prediction.numpy()[0, -1, 0])
-        input_data = tf.expand_dims(np.append(input_data.numpy()[0, 1:], [[future_predictions[-1]]], axis=0), axis=0)
-        date_ori.append(date_ori[-1] + timedelta(days=1))
-    
-    return scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1)), date_ori
+history = model.fit(
+    X_train, y_train,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    validation_data=(X_test, y_test),
+    callbacks=[lr_scheduler],
+    verbose=1
+)
 
-# Run simulations
-results = []
-for sim in range(SIMULATION_SIZE):
-    print(f"Simulation {sim+1}")
-    prediction, dates = forecast()
-    results.append(prediction.flatten())
+# Evaluate Model
+loss = model.evaluate(X_test, y_test)
+print(f"Test Loss: {loss}")
 
-# Filter valid results
-valid_results = [
-    result for result in results
-    if (result[-TEST_SIZE:] < df["Close"].min()).sum() == 0
-    and (result[-TEST_SIZE:] > df["Close"].max() * 2).sum() == 0
-]
+# Predict current test data
+predictions = model.predict(X_test)
+predictions = scaler.inverse_transform(
+    np.concatenate([predictions, np.zeros((len(predictions), len(features) - 1))], axis=1)
+)[:, 0]
+actual = scaler.inverse_transform(
+    np.concatenate([y_test.reshape(-1, 1), np.zeros((len(y_test), len(features) - 1))], axis=1)
+)[:, 0]
 
-accuracies = [
-    calculate_accuracy(df["Close"].values, result[:-TEST_SIZE])
-    for result in valid_results
-]
-
-# Plot results
-plt.figure(figsize=(15, 5))
-for i, result in enumerate(valid_results):
-    plt.plot(result, label=f"Forecast {i+1}")
-plt.plot(df["Close"], label="True Trend", color="black")
+# Plot Predictions
+plt.figure(figsize=(12, 6))
+plt.plot(actual, label="Actual Prices", color="blue")
+plt.plot(predictions, label="Predicted Prices", color="orange")
+plt.title(f"{symbol} Stock Price Prediction (Current Data)")
+plt.xlabel("Days")
+plt.ylabel("Price")
 plt.legend()
-plt.title(f"Stock: {args.symbol} | Avg. Accuracy: {np.mean(accuracies):.2f}%")
-plt.xticks(np.arange(0, len(dates), 30), dates[::30], rotation=45)
-plt.tight_layout()
 plt.show()
 
-# Clean up
-os.remove("data.csv")
+# Forecast future prices (50 years = ~12500 trading days assuming 250 trading days per year)
+FUTURE_DAYS = 12500
+future_predictions = forecast_future(data_scaled, model, scaler, FUTURE_DAYS, len(features))
+
+# Plot Future Predictions
+plt.figure(figsize=(12, 6))
+plt.plot(range(len(df)), scaler.inverse_transform(data_scaled)[:, 0], label="Historical Prices", color="blue")
+plt.plot(range(len(df), len(df) + FUTURE_DAYS), future_predictions, label="Future Predictions", color="green")
+plt.title(f"{symbol} Stock Price Prediction (Next 50 Years)")
+plt.xlabel("Trading Days")
+plt.ylabel("Price")
+plt.legend()
+plt.show()
+
+# Save the Model
+model.save(f"{symbol}_stock_model.h5")
+print(f"Model saved as {symbol}_stock_model.h5")
